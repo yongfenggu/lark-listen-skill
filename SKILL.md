@@ -91,8 +91,8 @@ print(os.path.dirname(os.path.dirname(glob.glob(os.path.expanduser('~/.claude/sk
 
 **③ 单独建群**
 拉一个只有「bot + 当前会话用户」两个人的专属群，作为本 session 的会话窗口。
-- 建群对象：默认通过 config 里的当前会话用户（owner open_id，如 `ou_31519983792b3249a10ec538af1cc433`）；也可指定其他人或名字。
-- 群名规则：`当前工作目录名 + 时间`，如 `coco-20260910`。
+- 建群对象：默认通过 config 里的当前会话用户（owner open_id，如 `ou_xxx`）；也可指定其他人或名字。
+- 群名规则：`当前工作目录名 + 时间`，如 `myproject-20260910`。
 - 命令（bot 身份建群，把当前用户拉进去）：
   ```bash
   lark-cli im +chat-create --name "<workdir名>-<YYYYMMDD>" --users <owner_open_id> --as bot
