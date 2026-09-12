@@ -18,7 +18,7 @@ metadata:
 
 分两个阶段，通讯渠道不同，别混：
 
-- **启动阶段**（用户通过**终端**命令"开始监听飞书" → Claude 启动进程、确认状态）：所有反馈**在终端给用户**，不要发飞书。此阶段用户在终端；往飞书发是噪音，还可能干扰另一个正在监听的会话。**首次使用引导尤其要注意**：第一步检查发现无 config 时，第二步的"消息来源四选一"等所有引导问题一律在**终端用 AskUserQuestion** 问，不要在飞书发消息问——此时监听渠道还没建立，用户也还在终端前。直到 config 锁定、常驻监听启动，才发飞书「我在这里开始接收消息」作为起点，之后才转入飞书交互。典型：启动被单实例锁挡住（`[LOCK] already running`）时，**在终端**说"这个聊天已在另一个会话监听，未重复启动"，不发飞书。
+- **启动阶段**（用户通过**终端**命令"开始监听飞书" → Claude 启动进程、确认状态）：所有反馈**在终端给用户**，不要发飞书。此阶段用户在终端；往飞书发是噪音，还可能干扰另一个正在监听的会话。**首次使用引导尤其要注意**：第一步检查发现无 config 时，第二步的"消息来源四选一"等所有引导问题一律在**终端用 AskUserQuestion** 问，不要在飞书发消息问——此时监听渠道还没建立，用户也还在终端前。直到 config 锁定、常驻监听启动，才发飞书「我在这里开始接收消息」作为起点，之后才转入飞书交互。典型：启动被 stale-pid 检查挡住（`[LOCK] 已有进程 … 监听 …,本次退出避免重复中继`）时，**在终端**说"这个聊天已在另一个会话监听，未重复启动"，不发飞书。
 - **运行阶段**（监听已启动后，用户通过**飞书消息**交互）：所有提问、选项、确认一律通过 `lark-cli im +messages-reply/--send` 发飞书，禁止终端 AskUserQuestion。用户那侧是飞书，终端选项看不到。监听期间 Claude 与用户的通讯渠道就是飞书消息本身。
 
 ## 核心流程
@@ -137,7 +137,7 @@ python3 scripts/listen.py --lock --workdir ./.lark-listen
 
 用上一步拿到的 ID（或第一步从 config 复用的 ID）启动常驻监听。**前台运行，不 daemon 化**——监听进程挂在 Claude Code 的进程树下，session 关闭时随 Claude 一起退出，不留僵尸。
 
-**顺序：先启动新监听 → 由 Claude 主动发就绪通知 → 再清理旧僵尸。** 脚本本身不自动发就绪通知（保持零智能、只过滤+中继），就绪消息由触发本 skill 的 Claude 会话主动调用 lark-cli 发送。
+**顺序：先启动新监听（脚本自动检查 stale-pid） → 由 Claude 主动发就绪通知。** 脚本本身不自动发就绪通知（保持零智能、只过滤+中继），就绪消息由触发本 skill 的 Claude 会话主动调用 lark-cli 发送。启动时脚本自动执行 stale-pid 检查,无需手动清理旧进程。
 
 1. **先启动**（用 Bash 的 `run_in_background: true`，不要 `nohup`/`&`）：
    ```bash
@@ -165,16 +165,7 @@ python3 scripts/listen.py --lock --workdir ./.lark-listen
 
    > **首次配置的"起点"**：若是首次使用引导一路走到这里（第二步 → connect → 第三步），Claude 发的就绪消息即作为正式起点。重连/复用 config 的非首次场景同样由 Claude 主动发就绪消息。
 
-2. **再清理旧僵尸**（上一个 session 遗留的监听进程，防重复转发）：
-   ```bash
-   # 列出所有 listen.py 进程，找出不是本次启动的（PPID=1 或比本次早的）
-   pgrep -af "listen.py" | grep ".lark-listen"
-   # 按具体 PID kill，跳过本次启动的那个
-   kill <旧pid>; sleep 1
-   ```
-   > 前台模式下本次启动的进程 PPID 是 Claude 的 shell（不是 1），不会误杀。旧 nohup 僵尸的 PPID=1，一眼区分。
-
-   > **⚠️ 绝对不要用 `pkill -f listen.py`。** 它会匹配**所有** listen.py 进程，包括别的 session 正在用的监听——会误杀别人（你曾在别的赛事 session 里监听群聊，被这条命令误杀过）。清理只按具体 PID，一条一条确认再 kill。详见下方「进程清理机制」。
+2. **再清理旧僵尸**：脚本启动时自动执行 stale-pid 检查（见下方「启动前 stale-pid 检查」），无需 Claude 手动 pgrep+kill。脚本读 pid 文件 → 按 lock_id 精确判断旧进程是否存活 → 存活且监听同一 lock_id 则本次退出避免重复中继,已死则清理僵尸 pid 文件后正常启动。
 
 **`--mention-only`（群里只有 @bot 才响应）：** 加上后脚本只中继 @了 bot 的消息，没 @ 的静默丢弃（源头过滤，省 token）。需要配 `--bot-id` 传 bot 的 open_id，否则只要 mentions 非空即算命中。bot 的 open_id 可这样取（取 bot 自己发过的某条消息的 sender.open_bot_id）：
 
@@ -188,7 +179,7 @@ print(next(i['sender']['open_bot_id'] for i in d['data']['items']\
 
 启动后先看 `listen.log` 里是否出现 `[CFG] 复用上次锁定 …` 或 `BUS ready`，确认进入 consuming。
 
-> **不做进程级防重**：脚本不做单实例锁——每次启动就是一个独立监听进程。重复中继/重复回复由两点保证：①启动前清理旧进程（见上）；②前台运行随 session 生灭，关 session 自动退出，不会跨 session 残留成"旧进程"。
+> **启动前 stale-pid 检查（脚本内置）**：脚本启动时自动读 pid 文件,按 lock_id 精确判断旧进程是否存活——存活且监听同一 lock_id 则本次退出避免重复中继,已死则清理僵尸 pid 文件后正常启动。无需 Claude 手动 pgrep+kill,zero-shot 启动即可。前台运行随 session 生灭，关 session 自动退出，不会跨 session 残留成"旧进程"。
 
 脚本行为：
 - 消费 `im.message.receive_v1`，按锁定 ID 过滤：`chat` 比对 `chat_id`，`user` 比对 `sender_id`。
@@ -273,7 +264,7 @@ lark_retry lark-cli im +messages-send --chat-id <chat_id> --text "回复内容" 
 
 ## 进程清理机制（三重保险，随 session 生灭）
 
-监听进程由 Bash `run_in_background` 启动，外层 shell 会 setsid 把它脱离 Claude 的进程组——Claude 退出时内核**不会**给它发 SIGHUP，会残留成僵尸（PPID=1）继续监听。三重机制保证它随 session 生灭，互为兜底：
+监听进程由 Bash `run_in_background` 启动，外层 shell 会 setsid 把它脱离 Claude 的进程组——Claude 退出时内核**不会**给它发 SIGHUP，会残留成僵尸（PPID=1）继续监听。**启动前**脚本自动做 stale-pid 检查（按 lock_id 精确判断旧进程是否存活），**运行中**三重机制保证它随 session 生灭，互为兜底：
 
 | 保险 | 位置 | 触发时机 | 作用范围 |
 |---|---|---|---|
@@ -289,7 +280,7 @@ lark_retry lark-cli im +messages-send --chat-id <chat_id> --text "回复内容" 
 
 > **三者互补**：hook 是即时、主动、精确的；看护是 hook 失效（如 settings 未重载）或 Claude 异常崩溃时的兜底；atexit 处理正常退出的文件残留。即使 hook 没生效，看护也会在 ~3s 内让僵尸自行退出。
 
-> **⚠️ 清理永远按具体 PID，禁止 `pkill -f listen.py`**——它会匹配所有 listen.py 进程，误杀别的 session 正在用的监听（曾有事故：在 A session 用 pkill，把 B session 正在监听的群聊进程也杀了）。清理旧僵尸时逐个 `pgrep -af "listen.py" | grep ".lark-listen"` 看清楚 PPID/启动时间，按 PID kill，跳过本次启动的那个。
+> **⚠️ 禁止 `pkill -f listen.py`**——它会匹配所有 listen.py 进程，误杀别的 session 正在用的监听（曾有事故：在 A session 用 pkill，把 B session 正在监听的群聊进程也杀了）。启动时脚本已自动按 lock_id 做 stale-pid 检查（见上方「启动前 stale-pid 检查」），无需手动 pgrep+kill。如确需手动排查,逐个 `pgrep -af "listen.py" | grep ".lark-listen"` 看清楚 PID,按具体 PID 操作。
 
 ### 把 skill 给别人（分发需手动配 hook）
 

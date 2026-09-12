@@ -14,7 +14,8 @@ lark-listen — 通用飞书消息监听管道（skill 脚本，轻量、零智�
                         非命中静默丢弃。输出文件按 lock_id 命名，多实例互不干扰。
 
 工程加固：
-  - 单实例锁：同 lock_id 已有进程在跑时新进程直接退出，防重复中继。
+  - stale-pid 检查：启动时自动读 pid 文件,按 lock_id 精确判断旧进程是否存活,
+    存活且监听同一 lock_id 则退出避免重复中继,已死则清理僵尸 pid 文件后正常启动。
   - event_id 去重：防事件流重放/多 Monitor 重复触发。
   - 旁观上下文（--bystander，群聊场景）：非命中消息缓冲，下次命中时注入只读上下文。
 
@@ -48,6 +49,56 @@ def _remove_pid_file(path: str) -> None:
             os.remove(path)
     except Exception:
         pass
+
+
+def _check_stale_pid(pid_path: str, lock_id: str, workdir: str) -> None:
+    """检查同 lock_id 是否已有监听进程在跑。
+
+    读 pid 文件 → 验证进程存活 → 验证命令行含同一个 lock_id。
+    - 进程存活且监听同一 lock_id:已有进程在跑,打印提示后 sys.exit(0) 避免重复中继。
+    - 进程已死(僵尸 pid 文件):清理 pid 文件,让本次正常启动。
+    - pid 文件不存在或指向别的 lock_id:无冲突,正常继续。
+
+    这是 zero-shot 启动的关键:不靠 Claude 手动检查旧进程,脚本自动处理。
+    """
+    if not os.path.exists(pid_path):
+        return
+    try:
+        with open(pid_path) as f:
+            content = f.read().strip()
+        parts = content.split()
+        if len(parts) < 2:
+            return
+        old_pid = int(parts[-1])
+    except (ValueError, OSError):
+        return
+
+    try:
+        os.kill(old_pid, 0)
+    except (ProcessLookupError, PermissionError):
+        log("PID", f"清理僵尸 pid 文件:{pid_path} → 旧 PID {old_pid} 已退出", workdir)
+        try:
+            os.remove(pid_path)
+        except Exception:
+            pass
+        return
+
+    try:
+        with open(f"/proc/{old_pid}/cmdline", "rb") as cf:
+            cmdline = cf.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+    except (FileNotFoundError, ProcessLookupError, OSError):
+        log("LOCK", f"已有进程 {old_pid} 监听 {lock_id},本次退出避免重复中继", workdir)
+        sys.exit(0)
+
+    if lock_id in cmdline and "listen.py" in cmdline:
+        log("LOCK", f"已有进程 {old_pid} 监听 {lock_id},本次退出避免重复中继", workdir)
+        sys.exit(0)
+    else:
+        log("PID", f"pid 文件指向进程 {old_pid} 不监听 {lock_id}(cmd: {cmdline[:80]}),清理后继续", workdir)
+        try:
+            os.remove(pid_path)
+        except Exception:
+            pass
 
 
 def main():
@@ -119,6 +170,7 @@ def main():
     # 写 pid 文件：供 SessionEnd hook 按 session_id 精确清理本 session 启动的监听进程
     # 内容格式：「<CLAUDE_CODE_SESSION_ID> <PID>」，缺 session_id 时以「-」占位
     pid_path = os.path.join(workdir, f"{args.lock_id}.pid")
+    _check_stale_pid(pid_path, args.lock_id, workdir)
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "-") or "-"
     try:
         with open(pid_path, "w") as f:
