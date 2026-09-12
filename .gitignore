@@ -1,5 +1,15 @@
+# 运行时文件(监听输出/pid/日志,不提交)
+*.out
+*.pid
+*.log
+*.stderr
+*.stdout
+
+# Python 缓存
 __pycache__/
 *.pyc
 *.pyo
+
+# 环境
 .env
 .DS_Store
